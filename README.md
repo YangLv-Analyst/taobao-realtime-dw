@@ -370,13 +370,43 @@ import os
 SECRET_KEY = 'taobao-realtime-dw-2026-secret-key'
 SQLALCHEMY_DATABASE_URI = 'sqlite:////home/yanglv/superset.db'
 WTF_CSRF_ENABLED = False
-EOF
 
-export SUPERSET_CONFIG_PATH=~/superset_config.py
+# 展示时区：MySQL 存 UTC，Superset 渲染时自动 +8 成北京时间
+DISPLAY_TIMEZONE = 'Asia/Shanghai'
+
+# 实时数仓必须禁用全部 4 类缓存通道，缺一个都会导致图表显示旧数据
+CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
+DATA_CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
+FILTER_STATE_CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
+EXPLORE_FORM_CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
+EOF
+```
+
+> ⚠️ **`SQLALCHEMY_ENGINE_OPTIONS = {"server_side_cursors": True}` 绝对不能加**，
+> 元数据库是 SQLite，不支持服务端游标，加了直接 `Failed to create app`（见坑 22）。
+
+#### 6.2.1 让配置文件真正被加载（最关键的一步）
+
+Superset **不会自动读取** `~/superset_config.py`。只在某个终端 `export` 过一次，
+新开终端就失效，所有配置项（时区、缓存、SECRET_KEY）全部空转：
+
+```bash
+# 写进 ~/.bashrc 永久生效
+echo 'export SUPERSET_CONFIG_PATH=$HOME/superset_config.py' >> ~/.bashrc
+source ~/.bashrc
+
+# 初始化 + 启动
 superset db upgrade
 superset fab create-admin
 superset init
 superset run -p 8089 --with-threads
+```
+
+**生效判定标准**（启动日志必须同时满足两条）：
+
+```
+Loaded your LOCAL configuration at [/home/yanglv/superset_config.py]   <-- 必须有这行
+（且不出现）A Default SECRET_KEY was detected                            <-- 必须没这行
 ```
 
 > **坑 11：SECRET_KEY 不安全拒绝启动**
@@ -426,11 +456,22 @@ curl -X POST "http://localhost:8089/api/v1/database/" \
 > - 原因：Flask-WTF 的 CSRF 保护阻止了 curl 请求
 > - 解决：配置文件中加 `WTF_CSRF_ENABLED = False`
 
-#### 6.4 创建图表
+#### 6.4 创建图表（最终版：4 个图表）
 
-1. **柱状图**（品类销售额对比）：X 轴 `category`，Y 轴 `SUM(total_sales)`
-2. **折线图**（销售趋势）：X 轴 `window_end`，Y 轴 `SUM(total_sales)`，Group By `category`，Time Grain 设为 `Minute`
-3. **时间过滤器**：Filter `window_end`，选 `Last day`
+| 图表名 | 类型 | 关键配置 | 作用 |
+|--------|------|---------|------|
+| 数据最新时间 | Big Number（或 Table） | Metric 用 Custom SQL `MAX(window_end)` | 一眼证明数据新鲜度 |
+| 累计销售额 | Big Number with Trendline | Metric `SUM(total_sales)`，Time Grain `Minute` | 大数字 + 迷你趋势线 |
+| 品类销售趋势 | Line Chart | X 轴 `window_end`，Time Grain `Minute`，Metrics `SUM(total_sales)`，Dimensions `category` | 分钟级实时趋势 |
+| 品类销售额对比 | Table Chart | 列 `category` / `window_end` / `SUM(total_sales)` / `SUM(order_count)` | 明细核对 |
+
+**所有图表的统一硬性要求**（每一条都对应一个踩过的坑）：
+
+- 数据集一律指向 VIEW `v_dws_category_sales`，不直连物理表
+- Filters 一律 **No filter**（见坑 27）
+- Row limit 一律 **50000**（见坑 26）
+- Contribution Mode 一律 **None**（见坑 28）
+- Big Number 显示日期若变成 Unix 时间戳或 `NaN`，改用 Table 类型渲染
 
 > **坑 17：折线图只有两行**
 > - 现象：折线图只显示 2 个数据点
@@ -442,9 +483,181 @@ curl -X POST "http://localhost:8089/api/v1/database/" \
 > - 原因：category 是维度，不应放 Metrics 区域
 > - 解决：category 拖到 Group By/Dimensions，不选聚合
 
+#### 6.5 时区攻坚实录
+
+这是整个项目耗时最长的一段排查。核心矛盾是：**MySQL 的 `DATETIME` 类型不携带任何时区元数据**，
+所以同一个 `2026-09-03 05:16:00`，生产者、Flink、MySQL、Superset 四方各有各的解释。
+
+**最终确定的全链路 UTC 策略**：
+
+| 层级 | 配置 | 结果 |
+|------|------|------|
+| Python 生产者 | `datetime.utcnow().strftime(...)` | 生成 UTC 字符串 |
+| Flink JVM | `env.java.opts: -Duser.timezone=UTC` | 窗口时间按 UTC 计算 |
+| JDBC Sink | URL 加 `serverTimezone=UTC` | 写入不被驱动二次转换 |
+| MySQL | `DATETIME` 存 UTC 原值 | `05:16` |
+| VIEW | **直通，不做任何 DATE_ADD** | `05:16` |
+| Superset | `DISPLAY_TIMEZONE = 'Asia/Shanghai'` | 渲染成 `13:16` ✅ |
+
+**排查过程中走过的弯路**：
+
+| 尝试方案 | MySQL 原值 | Superset 显示 | 结论 |
+|---------|-----------|--------------|------|
+| VIEW `DATE_ADD(+8)` + `DISPLAY_TIMEZONE` | 04:14 | 08:14 AM | ❌ 双重转换 |
+| VIEW `DATE_SUB(-8)` + `DISPLAY_TIMEZONE` | 04:16 | 前一天 20:16 | ❌ 反向偏移 |
+| 手动 `UPDATE` 历史数据 +8 | — | MAX 时间比当前还快 8h | ❌ 污染数据 |
+| VIEW 直通 + `DISPLAY_TIMEZONE` | 05:16 | 13:16 | ✅ 正解 |
+
+> **坑 19：全链路时区不一致**
+> - 现象：Superset tooltip 时间比北京时间慢 8 小时
+> - 原因：生产者用 `datetime.now()` 生成北京时间字符串，Flink JVM 却按 UTC 解释
+> - 解决：生产者改 `datetime.utcnow()`，Flink JVM 加 `-Duser.timezone=UTC`，JDBC URL 加 `serverTimezone=UTC`
+
+> **坑 20：VIEW 与 DISPLAY_TIMEZONE 双重转换**
+> - 现象：tooltip 显示时间比真实时间快 4~16 小时，随配置组合漂移
+> - 原因：VIEW 已 `DATE_ADD(+8)`，Superset 又按 `DISPLAY_TIMEZONE` +8
+> - 解决：**二选一，只能有一个 +8**。最终选 VIEW 直通 + `DISPLAY_TIMEZONE = 'Asia/Shanghai'`
+
+> **坑 21：用 UPDATE 修时区导致数据污染**
+> - 现象：VIEW 查出 `MAX(window_end)` 比当前时间还快 8 小时
+> - 原因：先手动 `UPDATE ... DATE_ADD(+8)` 改历史数据，之后 VIEW 又 +8，同一批数据被转了两次
+> - 解决：`TRUNCATE TABLE dws_category_sales` 清空，让 Flink 重新写入干净数据
+> - **教训：时区是展示层问题，永远不要动存储层的值**
+
+> **坑 22：SQLite 不支持 server side cursors**
+> - 现象：`sqlalchemy.exc.ArgumentError: Dialect SQLiteDialect_pysqlite does not support server side cursors` → `Failed to create app`
+> - 原因：配置里写了 `SQLALCHEMY_ENGINE_OPTIONS = {"server_side_cursors": True}`，这是 MySQL/PostgreSQL 才有的选项
+> - 解决：删掉该行；元数据库是 SQLite 时不要配任何引擎级游标选项
+
+> **坑 23：改动 SECRET_KEY 后全线 Invalid decryption key**
+> - 现象：所有图表、数据库连接列表都报 `Invalid decryption key`
+> - 原因：数据库密码是用旧 SECRET_KEY 加密存在 SQLite 里的，新 key 解不开
+> - 解决：重新添加 MySQL 连接，并绕过 ORM 直接清理旧记录（ORM 查询本身也会触发解密报错）：
+>   ```bash
+>   python3 -c "
+>   import sqlite3
+>   conn = sqlite3.connect('/home/yanglv/superset.db')
+>   conn.execute('UPDATE tables SET database_id = 2 WHERE database_id = 1')
+>   conn.execute('DELETE FROM dbs WHERE id = 1')
+>   conn.commit()
+>   "
+>   ```
+
+#### 6.6 实时性攻坚实录
+
+时区修好之后出现的第二个问题：**MySQL 数据明明是实时的，图表却停在 1.5 小时前**。
+
+> **坑 24：`superset_config.py` 根本没被加载（本项目最大的坑）**
+> - 现象：`DISPLAY_TIMEZONE`、`NullCache` 改了全无效果；`superset shell` 报 `A Default SECRET_KEY was detected` / `Refusing to start due to insecure SECRET_KEY`
+> - 原因：Superset 不会自动读取 `~/superset_config.py`，必须靠环境变量 `SUPERSET_CONFIG_PATH` 指定；只在某个终端 `export` 过，新开终端即失效
+> - 解决：写进 `~/.bashrc` 永久生效
+>   ```bash
+>   echo 'export SUPERSET_CONFIG_PATH=$HOME/superset_config.py' >> ~/.bashrc && source ~/.bashrc
+>   ```
+> - 验证：启动日志出现 `Loaded your LOCAL configuration at [...]` 且无 SECRET_KEY 警告
+
+> **坑 25：只禁 2 类缓存不够，图表仍滞后**
+> - 现象：MySQL `MAX(window_end)` = 当前时间，图表却停在 1.5 小时前；点 Update chart 也没用
+> - 原因：Superset 有 4 类缓存通道，只设 `CACHE_CONFIG` / `DATA_CACHE_CONFIG` 时，过滤器与探索表单缓存仍在返回旧结果
+> - 解决：4 个全部设为 `NullCache`（见 6.2 配置）
+
+> **坑 26：Row limit 1000 截断最新数据**
+> - 现象：跑了约 2.4 小时后图表又开始"变慢"，最新时间点不再前进
+> - 原因：7 个品类 × 每分钟 1 行 = 7 行/分钟，默认 Row limit 1000 只够 `1000 ÷ 7 ≈ 142 分钟`
+> - 解决：Row limit 改 **50000**（够撑约 5 天）；长期方案见"七、后续优化方向"
+
+> **坑 27：相对时间过滤器查不到数据**
+> - 现象：设 `1 hour ago → now` 后图表 No data，生成的条件是 `window_end >= 2026-09-03T13:23:48`
+> - 原因：Superset 用**服务器本地时间（WSL 继承 Windows = 北京时间）**计算相对范围，而表里存的是 UTC 值，两边差 8 小时，条件永远匹配不上
+> - 解决：保持 **No filter**；若要启用滚动窗口，需让 VIEW 输出北京时间并把 `DISPLAY_TIMEZONE` 改为 `UTC`，使过滤器与数据处于同一时区基准
+
+> **坑 28：Contribution Mode 被设成 Row**
+> - 现象：Y 轴变成 30% / 40% / 50%，看不到真实销售额，折线挤成一团
+> - 原因：Contribution Mode = Row 会按行归一化成百分比
+> - 解决：改成 **None**
+
+**实时性三重校验法**（排查时靠这三条定位问题，比反复改配置有效得多）：
+
+```bash
+# 校验 1：底层数据是否实时（latest_utc + 8h 应约等于 beijing_now）
+mysql -u flink -pflink123 taobao_realtime -e \
+  "SELECT MAX(window_end) AS latest_utc, NOW() AS beijing_now, COUNT(*) AS total FROM dws_category_sales;"
+
+# 校验 2：VIEW 是否直通（MIN/MAX/COUNT 应与物理表完全一致）
+mysql -u flink -pflink123 taobao_realtime -e \
+  "SELECT MIN(window_end), MAX(window_end), COUNT(*) FROM v_dws_category_sales;"
+
+# 校验 3：MySQL 服务器时区（SYSTEM 表示继承 Windows 时区 = UTC+8）
+mysql -u flink -pflink123 -e "SELECT @@global.time_zone, NOW(), UTC_TIMESTAMP();"
+```
+
+再配合前端两个数字交叉验证：
+
+- 图表底部 **`Last queried at`** = 当前时间 → 证明缓存已禁用，真的回源查询了
+- **行数反推**：`Results 行数 ÷ 品类数 ≈ 时间跨度分钟数`
+  实测 506 行 ÷ 7 品类 ≈ 72 分钟，正好对应 `13:32 → 14:44`，与 MySQL 完全吻合
+
+**端到端延迟测算**：
+
+| 环节 | 延迟 | 说明 |
+|------|------|------|
+| 生产者 → Kafka | < 100 ms | 同步 send |
+| Kafka → Flink 窗口关闭 | ≤ 60 s | TUMBLE 1 分钟窗口的固有延迟，架构下限 |
+| Flink → MySQL | < 1 s | JDBC upsert |
+| MySQL → Superset 查询 | < 50 ms | 主键索引，千行级数据 |
+| 仪表盘自动轮询 | ≤ 60 s | auto-refresh interval |
+| **合计** | **约 1~2 分钟** | 达到分钟级实时看板标准 |
+
+#### 6.7 仪表盘组装与前端问题
+
+**布局建议**：
+
+```
++------------------------------------------+
+| [数据最新时间]        [累计销售额]         |  <- 两个大数字并排，占顶部一小行
++------------------------------------------+
+| [品类销售趋势 折线图]（占满整行）           |
++------------------------------------------+
+| [品类销售额对比 表格]（占满整行）           |
++------------------------------------------+
+```
+
+**自动刷新**（只有仪表盘浏览模式有，图表编辑页永远不自动刷新）：
+
+1. 顶部 `Dashboards` → 点仪表盘**蓝色标题**进入浏览模式
+2. 右上角 `⋮` → **Set auto-refresh interval** → 选 `1 minute`
+3. 生效标志：右上角出现 `Refreshing every 1 minute`，保持标签页开着别关
+
+> **坑 29：图表编辑页不会自动前进，误以为项目失败**
+> - 现象：折线图最新时间点长时间不动，怀疑数据链路断了
+> - 原因：所有 BI 工具的图表都是**一次查询的快照**，不点 Update chart 就不会重新查询；不存在"再过几小时就追上"的机制
+> - 解决：自动刷新只能配在**仪表盘**上；图表编辑页仅用于调试
+
+> **坑 30：Save 按钮一直灰色**
+> - 现象：仪表盘编辑模式下 Save 始终不可点
+> - 原因：把仪表盘名字输进了右侧面板顶部的**图表搜索框**（那是用来筛选图表列表的）；切换排序方式也不算改动
+> - 解决：真正的标题框在**画布顶部**，placeholder 是 `Title is required`；输入后 Save 立即变亮
+
+> **坑 31：切换数据集后图表配置全丢**
+> - 现象：Swap dataset 后 X 轴 / Metrics / Dimensions 全部清空，报 `Missing dataset`
+> - 原因：Superset 切换数据集会重置图表配置
+> - 解决：切换前记录配置；或改用 `Datasets` 里修改 Database 指向的方式，避免 Swap
+
+> **坑 32：前端 NotFoundError removeChild**
+> - 现象：`NotFoundError: Failed to execute 'removeChild' on 'Node'：被移除的节点不是该节点的子节点`
+> - 原因：浏览器自动翻译插件直接改 DOM，与 React 虚拟 DOM 冲突；或重启 Superset 后前端状态过期
+> - 解决：`Ctrl+Shift+R` 硬刷新 → 关闭"翻译此页"（选"永不翻译此网站"）→ 无痕窗口排除其他扩展
+
+> **坑 33：MySQL 保留字做列别名**
+> - 现象：`ERROR 1064 (42000) ... near 'current_time, COUNT(*)...'`
+> - 原因：`current_time` 是 MySQL 保留字
+> - 解决：别名换成 `now_time` / `beijing_now`
+
 ---
 
-## 四、踩坑总结（Top 10）
+## 四、踩坑总结（33 条）
+
+### 数据链路层 Top 10（坑 1~18 精选）
 
 | # | 坑 | 根因 | 解决 |
 |---|-----|------|------|
@@ -459,31 +672,75 @@ curl -X POST "http://localhost:8089/api/v1/database/" \
 | 9 | mysqlclient 编译失败 | 缺系统依赖 + apt 过期 | `apt update` + 装开发库 |
 | 10 | API 认证失败 | 用户名大写 + CSRF | 用正确用户名 + 禁用 CSRF |
 
+### 可视化层踩坑（坑 19~33）
+
+| # | 坑 | 根因 | 解决 |
+|---|-----|------|------|
+| 19 | 图表时间慢 8 小时 | 生产者 `datetime.now()` 与 Flink UTC 混用 | 全链路统一 UTC |
+| 20 | 时间快 4~16 小时漂移 | VIEW +8 与 DISPLAY_TIMEZONE +8 双重转换 | VIEW 直通，只保留一个 +8 |
+| 21 | MAX 时间比当前还快 | 手动 UPDATE 修时区污染数据 | TRUNCATE 让 Flink 重写 |
+| 22 | Superset 启动即崩 | SQLite 不支持 server_side_cursors | 删掉 ENGINE_OPTIONS |
+| 23 | Invalid decryption key | 改了 SECRET_KEY，旧密码解不开 | 重连 + sqlite3 绕过 ORM 清库 |
+| 24 | **配置全部空转** | **未设 `SUPERSET_CONFIG_PATH`，配置文件没被加载** | **写进 `~/.bashrc` 永久生效** |
+| 25 | 图表滞后 1.5 小时 | 只禁了 2 类缓存，还有 2 类在缓存 | 4 类缓存全设 NullCache |
+| 26 | 2.4 小时后又变慢 | Row limit 1000 只够 142 分钟 | Row limit 改 50000 |
+| 27 | 相对时间过滤器 No data | 过滤器用北京时间，数据是 UTC | 保持 No filter |
+| 28 | Y 轴变成百分比 | Contribution Mode = Row | 改成 None |
+| 29 | 图表不会自己前进 | BI 图表是查询快照 | 仪表盘配 auto-refresh 1 min |
+| 30 | Save 按钮灰色 | 名字输进了图表搜索框 | 标题框在画布顶部 |
+| 31 | 切换数据集配置全丢 | Superset Swap dataset 会重置配置 | 切换前记录配置 |
+| 32 | removeChild 报错 | 浏览器翻译插件改 DOM | 硬刷新 + 关翻译 |
+| 33 | ERROR 1064 | `current_time` 是保留字 | 别名换 `now_time` |
+
+> **最有价值的一条**：坑 24（配置文件未加载）。它让前面所有时区与缓存修改全部无效，
+> 排查时却一直以为是配置内容写错了。**改配置前先确认配置有没有被加载**，
+> 判定标准就是启动日志里那行 `Loaded your LOCAL configuration at [...]`。
+>
+> **第二有价值的**：坑 29（图表是快照）。这不是 Bug 而是所有 BI 工具的通性，
+> 实时数仓的价值在于**后端链路延迟低**，前端的"动"靠仪表盘轮询实现。
+
 ---
 
 ## 五、项目结构
 
 ```
 taobao-realtime-dw/
-├── order_producer.py      # 高仿真订单生产者（6 大仿真参数）
+├── order_producer.py      # 高仿真订单生产者（6 大仿真参数，UTC 时间戳）
 ├── requirements.txt       # Python 依赖
 ├── sql/
-│   ├── flink_realtime.sql # Flink SQL 脚本（源表 + 双 Sink + 聚合）
-│   ├── mysql_schema.sql   # MySQL 建表脚本
-│   ── kafka_topics.sh    # Kafka 主题创建命令
+│   ├── flink_realtime.sql # Flink SQL 脚本（源表 + 双 Sink + TUMBLE 聚合）
+│   ├── mysql_schema.sql   # MySQL 建表 + 可视化 VIEW（v_dws_category_sales）
+│   └── kafka_topics.sh    # Kafka 主题创建命令
 ├── .gitignore
-── README.md              # 本文档
+└── README.md              # 本文档（含 33 条踩坑记录）
 ```
 
 ---
 
 ## 六、运行效果
 
-### 实时销售大屏
+### 实时销售大屏（淘宝实时销售看板）
 
-- **柱状图**：8 个品类销售额对比（Electronics > Home > Clothing 前三）
-- **折线图**：每分钟销售趋势，晚 21 点明显爆单峰值
-- **时间过滤器**：可按 Last hour / Last day / Last 7 days 筛选
+四个图表 + 1 分钟自动轮询，打开后无需任何手动操作即可看到数据自己往前走：
+
+- **数据最新时间**（Big Number）：显示 `MAX(window_end)`，每分钟前进一格，是数据新鲜度的直接证据
+- **累计销售额**（Big Number with Trendline）：大数字持续增长，底部迷你趋势线同步延长
+- **品类销售趋势**（Line Chart）：8 个品类分钟级折线，最右端每分钟新增一个数据点
+- **品类销售额对比**（Table Chart）：`category` / `window_end` / `SUM(total_sales)` / `SUM(order_count)` 明细
+
+### 实时性实测
+
+某一时刻的三方对齐验证（北京时间 15:44）：
+
+| 观测点 | 数值 |
+|--------|------|
+| MySQL `MAX(window_end)` | `2026-09-03 06:44:00` (UTC) |
+| MySQL `NOW()` | `2026-09-03 14:44:24` (北京时间) |
+| Superset `Last queried at` | `09/03/2026 2:44:54 PM` |
+| Superset 折线图最右端 tooltip | `Thu Sep 03, 02:44 PM` |
+| Results 行数 | 506 行 ÷ 7 品类 ≈ 72 分钟，覆盖 `13:32 → 14:44` |
+
+四个时间点完全对齐，**端到端延迟 ≤ 1 分钟**（即 Flink TUMBLE 窗口的固有延迟）。
 
 ### 数据样例
 
@@ -491,11 +748,13 @@ taobao-realtime-dw/
 +-------------+---------------------+-------------+-------------+
 | category    | window_end          | total_sales | order_count |
 +-------------+---------------------+-------------+-------------+
-| Electronics | 2026-09-03 02:13:00 |    34865.51 |          14 |
-| Home        | 2026-09-03 02:13:00 |    41034.66 |          16 |
-| Clothing    | 2026-09-03 02:13:00 |    30302.29 |          37 |
+| Electronics | 2026-09-03 06:44:00 |    21903.44 |          11 |
+| Home        | 2026-09-03 06:44:00 |     1391.20 |           3 |
+| Clothing    | 2026-09-03 06:44:00 |     7462.18 |          19 |
 +-------------+---------------------+-------------+-------------+
 ```
+
+> `window_end` 存的是 UTC 值，Superset 按 `DISPLAY_TIMEZONE = 'Asia/Shanghai'` 渲染成北京时间 `14:44`。
 
 ---
 
@@ -506,6 +765,10 @@ taobao-realtime-dw/
 3. **OLAP 升级**：MySQL → Doris/ClickHouse（生产级查询性能）
 4. **维度扩展**：按城市、年龄段、支付方式多维分析
 5. **CEP 复杂事件处理**：检测异常订单模式（刷单、欺诈）
+6. **结果表生命周期管理**：按天分区 + TTL 定期清理，避免 DWS 表无限增长；或改用滚动时间窗口只查最近 1 小时（前提是解决坑 27 的过滤器时区基准问题）
+7. **时区基准统一**：把 `DATETIME` 换成 `TIMESTAMP`（MySQL 会带时区语义），或让 VIEW 输出北京时间 + `DISPLAY_TIMEZONE='UTC'`，使相对时间过滤器可用
+8. **秒级延迟**：TUMBLE 1 分钟窗口改为 10 秒滑动窗口，或引入 Flink CDC 直连；同时把 BI 数据源换成 Doris/ClickHouse 承接高并发轮询
+9. **数据质量监控**：对 1% 脏数据的拦截量、Kafka 消费 Lag、Flink Checkpoint 失败次数做告警
 
 ---
 

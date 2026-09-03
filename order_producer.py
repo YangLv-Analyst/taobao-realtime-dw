@@ -53,7 +53,7 @@ try:
             "quantity": random.randint(1, 5),
             "price": round(random.uniform(lo, hi), 2),
             "payment_method": random.choices(PAYMENTS, weights=PAYMENT_WEIGHTS)[0],
-            "invoice_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "invoice_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         }
         # 仿真参数 5：1% 脏数据（0.5% 退款负数量 + 0.5% 价格离群），给下游清洗留实战素材
         r = random.random()

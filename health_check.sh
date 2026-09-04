@@ -12,8 +12,12 @@
 #     >  180 秒    链路已停摆，按 坑34(进程被回收) -> 坑35(内存耗尽)
 #                  -> 坑38(生产者多实例) 的顺序排查
 #
-# 为什么信 lag_sec 而不信截图：BI 图表是一次查询的快照（坑 29），
-# 而 View query 面板里的 SQL 还被 sqlglot 美化过、会丢函数（坑 36）。
+# 为什么信 lag_sec 而不信截图：BI 图表是一次查询的快照（坑 29）。
+#
+# 但 lag_sec 只能证明「数据到得及时」，证明不了「图画得对」。所以还有第二条硬判定：
+# 第 [6] 节检查时间粒度表达式能否通过 sqlglot 往返。Superset 6.1.0 + sqlglot 28.10.1
+# 会在执行前删掉 DATE_ADD 第一个参数上的 DATE()，让分钟粒度变成「把当天的时分再加到
+# 自己身上」，折线图因此画到未来，而 lag_sec 全程正常（坑 36，修法见 README 6.9）。
 #
 # 用法：bash health_check.sh           # 两次采样，间隔 75 秒（必须 > 1 个窗口周期）
 #       bash health_check.sh --fast    # 只采样一次，快速看一眼
@@ -216,9 +220,99 @@ for sid, name, params, qc_raw in rows:
 print("  不一致/缺失的图表数 = %d" % bad)
 PY
 
-# ------------------------------------------------------------ 6 内存
+# ------------------------------------------------------------ 6 时间粒度表达式完整性
 echo ""
-echo "--- [6] 内存 ---"
+echo "--- [6] 时间粒度表达式完整性（sqlglot 往返，坑 36 / README 6.9） ---"
+SUP_CFG="${SUPERSET_CONFIG:-$HOME/superset_config.py}"
+SUP_PY="${SUPERSET_PY:-$HOME/superset-env/bin/python}"
+if [ ! -f "$SUP_CFG" ]; then
+  echo "  找不到配置文件 $SUP_CFG（可用 SUPERSET_CONFIG=... 指定）"
+  bad "找不到 superset_config.py，无法校验时间粒度表达式(坑36)"
+elif [ ! -x "$SUP_PY" ]; then
+  echo "  找不到 $SUP_PY（可用 SUPERSET_PY=... 指定），跳过本节"
+elif ! "$SUP_PY" -c 'import sqlglot' >/dev/null 2>&1; then
+  echo "  该 Python 环境里没有 sqlglot，跳过本节"
+else
+  RES="$(SUP_CFG="$SUP_CFG" "$SUP_PY" - 2>/dev/null <<'PY'
+import os
+import sys
+
+cfg = os.environ["SUP_CFG"]
+ns = {}
+try:
+    with open(cfg, encoding="utf-8") as f:
+        exec(compile(f.read(), cfg, "exec"), ns)
+except Exception as exc:
+    print("ERR 配置文件解析失败: %s" % exc)
+    sys.exit(0)
+
+addon = (ns.get("TIME_GRAIN_ADDON_EXPRESSIONS") or {}).get("mysql") or {}
+missing = [k for k in ("PT1S", "PT1M", "PT1H", "P1D") if k not in addon]
+if missing:
+    print("MISSING %s" % ",".join(missing))
+    sys.exit(0)
+
+try:
+    import sqlglot
+except Exception as exc:
+    print("ERR import sqlglot 失败: %s" % exc)
+    sys.exit(0)
+
+LIT = "'2026-09-04 13:07:42'"
+for k in sorted(addon):
+    tmpl = addon[k]
+    if not isinstance(tmpl, str) or "{col}" not in tmpl:
+        continue
+    sql = "SELECT %s AS t FROM v_dws_category_sales" % tmpl.format(col=LIT)
+    try:
+        out = sqlglot.parse_one(sql, dialect="mysql").sql(dialect="mysql")
+    except Exception as exc:
+        print("ERR %s 解析失败: %s" % (k, exc))
+        sys.exit(0)
+    if out.upper().count("DATE(") < sql.upper().count("DATE("):
+        print("MANGLED %s" % k)
+        sys.exit(0)
+
+# 输出 PT1M 经 sqlglot 往返后的表达式，交给 MySQL 实测求值
+node = sqlglot.parse_one(
+    "SELECT %s AS t" % addon["PT1M"].format(col=LIT), dialect="mysql"
+)
+print("OK %s" % node.expressions[0].this.sql(dialect="mysql"))
+PY
+  )"
+  if [ -z "$RES" ]; then
+    echo "  检查脚本无输出（$SUP_PY 异常？）"
+    bad "时间粒度完整性检查无法执行，请用 SUPERSET_PY 指定装有 sqlglot 的解释器"
+  else
+    VERDICT="${RES%% *}"
+    DETAIL="${RES#* }"
+    case "$VERDICT" in
+      OK)
+        echo "  TIME_GRAIN_ADDON_EXPRESSIONS['mysql'] 已配置，全部粒度通过 sqlglot 往返（DATE() 未被删除）"
+        GOT="$(q "SELECT ${DETAIL};")"
+        echo "  PT1M 经 sqlglot 往返后在 MySQL 求值 = ${GOT:-N/A}    期望 = 2026-09-04 13:07:00"
+        [ "$GOT" = "2026-09-04 13:07:00" ] || \
+          bad "PT1M 表达式求值结果是 '${GOT}' 而不是 2026-09-04 13:07:00，折线图时间轴会错位(坑36/README 6.9)"
+        ;;
+      MISSING)
+        echo "  配置里缺这些粒度: $DETAIL"
+        bad "superset_config.py 缺 TIME_GRAIN_ADDON_EXPRESSIONS['mysql'] 的 $DETAIL —— 折线图会显示未来时间(坑36)，照 README 6.2 补齐后重启 Superset"
+        ;;
+      MANGLED)
+        echo "  被 sqlglot 破坏的粒度: $DETAIL"
+        bad "时间粒度表达式 $DETAIL 被 sqlglot 删掉了 DATE()，折线图会显示未来时间(坑36/README 6.9)"
+        ;;
+      *)
+        echo "  $RES"
+        bad "时间粒度完整性检查失败: $DETAIL"
+        ;;
+    esac
+  fi
+fi
+
+# ------------------------------------------------------------ 7 内存
+echo ""
+echo "--- [7] 内存 ---"
 free -h | head -3
 AVAIL_MB="$(free -m | awk '/^Mem:/{print $7}')"; AVAIL_MB="${AVAIL_MB:-0}"
 SWAP_MB="$(free -m | awk '/^Swap:/{print $4}')";  SWAP_MB="${SWAP_MB:-0}"

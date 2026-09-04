@@ -380,6 +380,26 @@ CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
 DATA_CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
 FILTER_STATE_CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
 EXPLORE_FORM_CACHE_CONFIG = {'CACHE_TYPE': 'NullCache'}
+
+# ⚠️ 必加。修复 Superset 6.1.0 + sqlglot 28.10.1 破坏 MySQL 时间粒度表达式的 Bug：
+# sqlglot 会删掉 DATE_ADD 第一个参数上的 DATE()，使分钟粒度变成
+# 「把当天的时分再加到自己身上」，折线图因此画到未来（实际 13:14 画成次日 03:14）。
+# 原理、替代表达式的逐条验证与端到端实测见 6.9，坑 36。
+# 改完必须重启 Superset（该配置只在 app 初始化时读一次）。
+TIME_GRAIN_ADDON_EXPRESSIONS = {
+    'mysql': {
+        'PT1S': '{col}',
+        'PT1M': 'TIMESTAMP(DATE({col}), MAKETIME(HOUR({col}), MINUTE({col}), 0))',
+        'PT1H': 'TIMESTAMP(DATE({col}), MAKETIME(HOUR({col}), 0, 0))',
+        'P1D':  'DATE({col})',
+        'P1W':  'DATE({col} - INTERVAL (DAYOFWEEK({col}) - 1) DAY)',
+        '1969-12-29T00:00:00Z/P1W':
+            'DATE({col} - INTERVAL (DAYOFWEEK({col} - INTERVAL 1 DAY) - 1) DAY)',
+        'P1M':  'DATE({col} - INTERVAL (DAYOFMONTH({col}) - 1) DAY)',
+        'P3M':  'MAKEDATE(YEAR({col}), 1) + INTERVAL QUARTER({col}) QUARTER - INTERVAL 1 QUARTER',
+        'P1Y':  'DATE({col} - INTERVAL (DAYOFYEAR({col}) - 1) DAY)',
+    },
+}
 EOF
 ```
 
@@ -755,17 +775,34 @@ mysql -u flink -pflink123 -e "SELECT @@global.time_zone, NOW(), UTC_TIMESTAMP();
 > - 另外注意 `config.yaml` 里 `numberOfTaskSlots: 1`，两个 INSERT 作业需要 2 个 slot，
 >   必须额外 `taskmanager.sh start` 启第二个 TM；且配置只在集群启动时读一次，改完必须 stop/start-cluster.sh
 
-> **坑 36：「View query」面板显示的 SQL 是美化过的，会骗人**
-> - 现象：面板里的时间粒度表达式是
->   `DATE_ADD(window_end, INTERVAL (HOUR(window_end)*60 + MINUTE(window_end)) MINUTE)`，
->   **少了 `DATE()` 包裹**，看起来像个会把时间放大到荒谬值的错误表达式
-> - 原因：Superset 用 `sqlglot.transpile(sql, read='mysql', write='mysql', pretty=True)` 美化后再展示，
->   sqlglot 28.10.1 会删掉它认为冗余的 `DATE()`。用同版本本地复现，输出与面板**逐字符一致**
-> - 服务器真正执行的是：
->   `DATE_ADD(DATE(window_end), INTERVAL (HOUR(window_end)*60 + MINUTE(window_end)) MINUTE)`
-> - 而且这个表达式在 MySQL 上本身就是**恒等变换**（`DATE()` 截断到日，再把当天的时分按分钟加回去），
->   实测聚合前后行数、distinct 时间点数、MIN/MAX 完全相同，`sec_nonzero = 0`，不可能造成任何时间偏移
-> - 教训：**排查 SQL 问题不要相信界面展示，去抓服务器实际执行的语句**
+> **坑 36：sqlglot 在【执行路径】上重渲染 SQL，删掉了时间粒度表达式里的 `DATE()`（本项目最深的坑）**
+> - 现象：折线图 tooltip 显示**未来时间**（实际 `Sep 04 13:40`，画成 `Sat Sep 05, 03:14 AM`），
+>   X 轴标签跟着变成 `03 AM`；相邻数据点间隔从 1 分钟变成 **2 分钟**；
+>   而 MySQL 里连那个日期的行都不存在（`window_end > NOW()` 是空集）
+> - 面板里的粒度表达式是
+>   `DATE_ADD(window_end, INTERVAL (HOUR(window_end)*60 + MINUTE(window_end)) MINUTE)`，**少了 `DATE()` 包裹**
+> - ⚠️ 我最初判定这只是 `sqlglot.transpile(..., pretty=True)` 的**展示层美化失真**、
+>   服务器执行的是带 `DATE()` 的正确版本，并据此写下"这个表达式是恒等变换、不可能造成偏移"。
+>   **前半句对（面板输出确实与 sqlglot 逐字符一致），后半句错得离谱**——
+>   sqlglot 同样出现在执行路径上，被改写后的 SQL 才是真正送进 MySQL 的那一条
+> - 真实调用链（逐层抓出来的，不是推测）：
+>   ```
+>   superset/models/core.py:769   get_df
+>    → core.py:688                _execute_sql_with_mutation_and_logging
+>        script = SQLScript(sql, self.db_engine_spec.engine)
+>    → superset/sql/parse.py:1290  SQLScript.__init__ → split_script
+>    → parse.py:578                sqlglot.parse(script, dialect='mysql')
+>    → 回到 core.py                statement.format()   # 把 AST 渲染回字符串再执行
+>   ```
+> - sqlglot 28.10.1 认为 `DATE_ADD`/`DATE_SUB` **第一个参数**上的 `DATE()` 冗余，直接删掉：
+>   `DATE_ADD(x, INTERVAL (HOUR(x)*60+MINUTE(x)) MINUTE)` = 把当天的时分再加到自己身上，
+>   `13:07:42 → 2026-09-05 02:14:42`。分钟间距也因此从 1 分钟变 2 分钟
+>   （`f(13:00)=02:00`、`f(13:01)=02:02`），**这是识别本坑的指纹**
+> - 影响面：MySQL 的 `SECOND/MINUTE/HOUR/WEEK/MONTH/QUARTER/YEAR` 粒度**全部中招，只有 DAY 幸免**
+> - 解决：用官方配置项 `TIME_GRAIN_ADDON_EXPRESSIONS` 覆盖内置模板，完整方案与验证见 **6.9**
+> - 教训：**判断"某段代码有没有被执行"，不要看输出像不像，要看结果集对不对。**
+>   定案靠的是把两边结果集对撞——同一条 SQL 直接丢给 MySQL 得到 60 个连续分钟，
+>   Superset payload 里却是 60 个间隔 2 分钟的未来值。间隔变化排除了"平移"（时区），指向"二次变换"
 
 > **坑 37：图表时间范围要在 4 个地方同步，改一处不生效**
 > - 现象：改了 `params.time_range`，图表行为毫无变化
@@ -791,6 +828,102 @@ mysql -u flink -pflink123 -e "SELECT @@global.time_zone, NOW(), UTC_TIMESTAMP();
 >   ```
 >   再用 `kafka-get-offsets.sh` 观察 offset 是否稳定增长（该脚本需要 Java 17，否则报 `A JNI error`）
 
+#### 6.9 时间粒度表达式被 sqlglot 破坏（本项目最深的一个坑）
+
+时区（6.5）、滚动窗口（坑 27）、进程存活（6.8）全部搞定之后，折线图**还是**错的。
+这一节推翻了坑 36 最初的判断，也是整个项目最后一个未解之谜。
+
+##### 症状指纹（出现任意一条就该怀疑本坑）
+
+| 症状 | 正常值 | 中招时 |
+|------|--------|--------|
+| 相邻数据点间隔 | 1 分钟 | **2 分钟** |
+| tooltip 日期 | 当天 | **次日**，时间 = 当天时分再叠加一次 |
+| MySQL `window_end > NOW()` | 空集 | 空集（**库里没有未来数据，是算出来的**） |
+| `lag_sec` | 0~75 秒 | 0~75 秒（**链路完全健康，极易误判成前端问题**） |
+
+后两行是关键：数据侧所有指标都是绿的，故障纯粹发生在「Superset 生成 SQL → 送进 MySQL」之间。
+
+##### 根因：sqlglot 不只在展示层，它在执行路径上
+
+调用链见坑 36。被改写前后的对照（对 `2026-09-04 13:07:42` 求值，MySQL 实测）：
+
+| 表达式 | 结果 |
+|--------|------|
+| 内置模板（语义正确）`DATE_ADD(DATE(x), INTERVAL (HOUR(x)*60+MINUTE(x)) MINUTE)` | `2026-09-04 13:07:00` |
+| **被删掉 `DATE()` 后（实际执行的）**`DATE_ADD(x, INTERVAL (HOUR(x)*60+MINUTE(x)) MINUTE)` | **`2026-09-05 02:14:42`** |
+
+##### 修法：`TIME_GRAIN_ADDON_EXPRESSIONS`
+
+`MySQLEngineSpec.get_time_grain_expressions()` 里有官方覆盖入口，不需要碰任何私有属性：
+
+```python
+time_grain_expressions = cls._time_grain_expressions.copy()
+time_grain_expressions.update(
+    app.config["TIME_GRAIN_ADDON_EXPRESSIONS"].get(cls.engine, {})
+)
+```
+
+替换原则只有一条：**不要让 `DATE()` 出现在 `DATE_ADD` / `DATE_SUB` 的第一个参数上**。
+配置全文在 **6.2**，逐条验证结果如下：
+
+| 粒度 | 替代表达式 | sqlglot 往返 | MySQL 实测 |
+|------|-----------|-------------|-----------|
+| PT1S | `{col}` | 不变 | — |
+| PT1M | `TIMESTAMP(DATE(x), MAKETIME(HOUR(x), MINUTE(x), 0))` | 不变 | `13:07:42 → 13:07:00` ✅ |
+| PT1H | `TIMESTAMP(DATE(x), MAKETIME(HOUR(x), 0, 0))` | 不变 | `13:07:42 → 13:00:00` ✅ |
+| P1D | `DATE(x)` | 不变 | ✅ |
+| P1W | `DATE(x - INTERVAL (DAYOFWEEK(x)-1) DAY)` | 不变 | 周起 `2026-08-30` ✅ |
+| P1W（周一起） | `DATE(x - INTERVAL (DAYOFWEEK(x - INTERVAL 1 DAY)-1) DAY)` | 只把 `1` 引号化 | ✅ |
+| P1M | `DATE(x - INTERVAL (DAYOFMONTH(x)-1) DAY)` | 不变 | 月起 `2026-09-01` ✅ |
+| P3M | `MAKEDATE(YEAR(x),1) + INTERVAL QUARTER(x) QUARTER - INTERVAL 1 QUARTER` | 只加括号 | 季度起 `2026-07-01` ✅ |
+| P1Y | `DATE(x - INTERVAL (DAYOFYEAR(x)-1) DAY)` | 不变 | 年起 `2026-01-01` ✅ |
+
+> `TIMESTAMP(DATE(x), ...)` 里的 `DATE()` 之所以安全：sqlglot 只对 `DATE_ADD`/`DATE_SUB`
+> 的**第一个参数**做这个"化简"，`TIMESTAMP()` 的参数它不动。
+
+改完**必须重启 Superset**（该配置只在 app 初始化时读一次），且照例用 `setsid` 启动（坑 34）。
+
+##### 为什么不能靠 `SQL_QUERY_MUTATOR` 打补丁
+
+执行顺序决定了它救不了：
+
+```python
+script = SQLScript(sql, self.db_engine_spec.engine)   # ← sqlglot 在这里就把 DATE() 删了
+for i, statement in enumerate(script.statements):
+    sql_ = self.mutate_sql_based_on_config(
+        statement.format(),                           # ← mutator 拿到的是已被改写的 SQL
+        is_split=True,
+    )
+```
+
+默认 `MUTATE_AFTER_SPLIT = False` 时 `SQL_QUERY_MUTATOR` 甚至不会被调用；
+即便调用，也已经在破坏之后。所以唯一干净的注入点就是粒度表达式本身。
+
+##### 修复后的端到端实测（2026-09-04 14:22）
+
+| 观测点 | 数值 |
+|--------|------|
+| 服务器执行的 SQL | `SELECT TIMESTAMP(DATE(window_end), MAKETIME(HOUR(window_end), MINUTE(window_end), 0)) AS window_end, ...` |
+| WHERE | `window_end >= '2026-09-04 13:22:53' AND window_end < '2026-09-04 14:22:53'` |
+| payload 的 x 值 | `13:23:00 → 14:22:00`，60 个 distinct 时间点 |
+| 相邻间隔 | **`60.0` 秒**（修复前是 120 秒） |
+| 超过当前时间的点数 | **0**（修复前 60 个全是未来值） |
+| 被 sqlglot 破坏的粒度数 | **0 / 9** |
+| `lag_sec` | 55 秒 |
+
+##### 排查方法论（比结论更值钱）
+
+定案靠的是**结果集对撞**，而不是读代码推断：
+
+```
+同一条 SQL 直接丢给 MySQL : min=2026-09-04 12:55  max=2026-09-04 13:54  60 个连续分钟
+Superset payload 里的 x   : min=2026-09-05 01:58  max=2026-09-05 03:56  60 个点、间隔 2 分钟
+```
+
+间隔从 1 分钟变成 2 分钟，直接排除"整体平移"（时区问题）而指向"二次变换"；
+再代入 `f(x) = x + (HOUR(x)*60 + MINUTE(x)) 分钟` 逐个吻合，证据链才闭合。
+
 ### 阶段 7：一键启停与健康巡检（日常入口）
 
 前面阶段 1~6 的手工步骤只需在第一次搭建时走一遍。日常起停与排障用仓库根目录的两个脚本：
@@ -799,8 +932,8 @@ mysql -u flink -pflink123 -e "SELECT @@global.time_zone, NOW(), UTC_TIMESTAMP();
 # 拉起整条链路（幂等，可反复执行；已在跑的组件自动跳过）
 bash start_all.sh
 
-# 只读巡检：进程 / slots / lag_sec / VIEW +8 / 图表时间范围四处一致性
-bash health_check.sh          # 两次采样，间隔 30 秒，能判断数据是否仍在增长
+# 只读巡检：进程 / slots / lag_sec / VIEW +8 / 图表时间范围一致性 / 时间粒度完整性
+bash health_check.sh          # 两次采样，间隔 75 秒（必须 > 1 个窗口周期）
 bash health_check.sh --fast   # 只采样一次，快速看一眼
 ```
 
@@ -818,9 +951,14 @@ bash health_check.sh --fast   # 只采样一次，快速看一眼
 
 所有守护进程一律 `setsid ... < /dev/null > log 2>&1 &`，日志落在 `~/rt-logs/`（坑 34）。
 
-`health_check.sh` 的核心判定就一条：**`lag_sec` 必须落在 0~75 秒**。
-它是 `NOW() - MAX(v_dws_category_sales.window_end)`，比任何前端截图都可靠——
-图表是查询快照（坑 29），而 `View query` 面板里的 SQL 还被 sqlglot 美化过、会丢函数（坑 36）。
+`health_check.sh` 有两条硬判定：
+
+1. **`lag_sec` 必须落在 0~75 秒**。它是 `NOW() - MAX(v_dws_category_sales.window_end)`，
+   比任何前端截图都可靠——图表只是一次查询的快照（坑 29）。
+2. **时间粒度表达式必须能通过 sqlglot 往返**（第 `[6]` 节）。脚本会把配置里的 `PT1M`
+   表达式先过一遍 sqlglot、再丢给 MySQL 对 `'2026-09-04 13:07:42'` 求值，结果必须是
+   `2026-09-04 13:07:00`。这是坑 36 的回归门禁：**`lag_sec` 全绿但折线飞到未来**的那类故障，
+   只有这一条能拦住。
 
 健康时 `lag_sec` 会在 **0 ~ 约 65 秒之间来回振荡**：TUMBLE 窗口刚关闭时接近 0，
 下一个窗口关闭前涨到 60 多。所以阈值必须留出一个空窗口的余量：
@@ -884,7 +1022,7 @@ bash health_check.sh --fast   # 只采样一次，快速看一眼
 |---|-----|------|------|
 | 34 | 集群/生产者一转身就没了 | WSL 会话结束发 SIGHUP；Windows Job Object 回收子进程树 | 一律 `setsid` + 接管三个标准流 |
 | 35 | 作业 FAILED 且不自愈 | 内存耗尽饿死 TaskManager，心跳超时 + NoRestartBackoffTimeStrategy | 停掉离线集群释放 ~4GB，补启第二个 TM |
-| 36 | 面板 SQL 少了 `DATE()` | sqlglot 美化时删掉它认为冗余的函数 | 抓服务器实际执行的 SQL，别信界面 |
+| 36 | **折线飞到未来、点距从 1 分钟变 2 分钟** | **sqlglot 在执行前重渲染 SQL，删掉粒度表达式里的 `DATE()`** | **`TIME_GRAIN_ADDON_EXPRESSIONS` 覆盖内置模板（6.9）** |
 | 37 | 改了时间范围不生效 | 时间范围冗余存在 4 处，以 query_context 为准 | 4 处同步改，或直接走 UI |
 | 38 | 销售额凭空翻倍 | 同时存活多个生产者实例 | 启动前按命令行特征清一遍，只留一个 |
 
@@ -899,6 +1037,11 @@ bash health_check.sh --fast   # 只采样一次，快速看一眼
 > **第三有价值的**：坑 34（守护进程被回收）。它会让整条链路"看起来配好了却不动"，
 > 而故障点在进程管理、不在任何配置里，排查方向极易跑偏到 Superset 身上。
 >
+> **第四有价值的**：坑 36（sqlglot 在执行路径上改写 SQL）。它是唯一一个
+> 「数据侧全绿、`lag_sec` 正常、配置也全对」却仍然画错的故障，排查方向极易被带偏到时区或缓存上。
+> 识别指纹是**相邻点距从 1 分钟变成 2 分钟**；修法是覆盖时间粒度表达式（6.9），
+> 而不是去动 VIEW、时区或缓存。
+>
 > 另外，坑 29（图表是快照）不是 Bug 而是所有 BI 工具的通性，
 > 实时数仓的价值在于**后端链路延迟低**，前端的"动"靠仪表盘轮询实现。
 
@@ -910,7 +1053,7 @@ bash health_check.sh --fast   # 只采样一次，快速看一眼
 taobao-realtime-dw/
 ├── order_producer.py      # 高仿真订单生产者（6 大仿真参数，UTC 时间戳）
 ├── start_all.sh           # 一键拉起链路（setsid 常驻 + 内存预检，幂等可反复执行）
-├── health_check.sh        # 只读健康巡检（进程/slots/lag_sec/VIEW +8/图表配置一致性）
+├── health_check.sh        # 只读健康巡检（进程/slots/lag_sec/VIEW +8/图表配置/粒度完整性）
 ├── requirements.txt       # Python 依赖
 ├── sql/
 │   ├── flink_realtime.sql # Flink SQL 脚本（源表 + 双 Sink + TUMBLE 聚合）
@@ -969,6 +1112,22 @@ taobao-realtime-dw/
 > 另外正午时段 `hour_factor()` 系数只有 0.2（约 5 秒一单），部分品类在某些分钟没有成交，
 > 折线天然是断续的，这恰恰是高仿真数据应有的形态。
 
+### 实时性三验（2026-09-04 14:22，时间粒度修复后）
+
+坑 36 修复之后的第三次取证，这次直接读服务器执行的 SQL 与 payload 里的 x 值（完整过程见 6.9）：
+
+| 观测点 | 数值 |
+|--------|------|
+| 采样时刻（北京时间） | `2026-09-04 14:22:54` |
+| VIEW `MAX(window_end)` | `2026-09-04 14:22:00` |
+| `lag_sec` | 55 秒 |
+| 服务器执行的粒度表达式 | `TIMESTAMP(DATE(window_end), MAKETIME(HOUR(window_end), MINUTE(window_end), 0))` |
+| payload x 值范围 | `13:23:00 → 14:22:00`，60 个连续分钟，间隔严格 `60.0` 秒 |
+| 未来时间点 | 0 个 |
+
+至此「时区口径（坑 20）→ 滚动窗口（坑 27）→ 进程存活（坑 34/35）→ 粒度表达式（坑 36）」
+四个环节全部闭环，折线图最右端贴着当前分钟。
+
 ### 数据样例
 
 ```
@@ -999,10 +1158,13 @@ taobao-realtime-dw/
 7. **时区语义下沉到存储层**：把 `DATETIME` 换成 `TIMESTAMP`（MySQL 会带时区语义），
    届时可去掉 VIEW 里的 `DATE_ADD(+8)`，改由 Superset 按 `DISPLAY_TIMEZONE` 正常换算。
    ⚠️ 改造时必须同步撤掉 VIEW 的 +8，否则叠加成 +16
-8. **一键启停与健康巡检**：把 `setsid` 启动序列（坑 34）与 `lag_sec` 巡检（坑 35）沉淀成
-   `start_all.sh` / `health_check.sh`。今天的三类故障（TM 被杀、生产者被回收、内存耗尽）都会复发
-9. **秒级延迟**：TUMBLE 1 分钟窗口改为 10 秒滑动窗口，或引入 Flink CDC 直连；同时把 BI 数据源换成 Doris/ClickHouse 承接高并发轮询
-10. **数据质量监控**：对 1% 脏数据的拦截量、Kafka 消费 Lag、Flink Checkpoint 失败次数做告警
+8. ~~一键启停与健康巡检~~ **已完成**：`start_all.sh` / `health_check.sh` 已落地并通过实跑验证
+   （幂等性、75 秒双采样、退出码门禁）。三类故障（TM 被杀、生产者被回收、内存耗尽）都会复发，日常靠它们兜底
+9. **版本升级回归**：`TIME_GRAIN_ADDON_EXPRESSIONS`（6.9）是针对 Superset 6.1.0 + sqlglot 28.10.1
+   的绕过方案，属于「用配置修正上游 Bug」。升级任一方后必须重跑 `bash health_check.sh`，
+   其第 `[6]` 节会验证粒度表达式能否通过 sqlglot 往返；若上游已修复，可把这段配置整体删掉
+10. **秒级延迟**：TUMBLE 1 分钟窗口改为 10 秒滑动窗口，或引入 Flink CDC 直连；同时把 BI 数据源换成 Doris/ClickHouse 承接高并发轮询
+11. **数据质量监控**：对 1% 脏数据的拦截量、Kafka 消费 Lag、Flink Checkpoint 失败次数做告警
 
 ---
 
